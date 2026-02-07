@@ -1,13 +1,15 @@
 import os
 import json
+import re
+import threading
 import time
-from typing import Dict, Any, List
-from .tools.google_search.wrapper import GoogleSearchTool
-from .tools.wolfram_alpha.wrapper import WolframAlphaTool
-from .tools.arxiv.wrapper import ArxivTool
-from .tools.nature.wrapper import NatureTool
-from .tools.pubmed.wrapper import PubmedTool
-from .env import Gem
+from typing import Dict, Any, List, Callable
+
+import requests
+
+from core.file_manager import FileManager
+from gem_core.gem import Gem
+
 
 class ResearchAgent:
     def __init__(self):
@@ -15,10 +17,12 @@ class ResearchAgent:
         self.tools = {
             #"google_search": GoogleSearchTool,
             #"wolfram_alpha": WolframAlphaTool,
-            "arxiv": ArxivTool,
+            #s"arxiv": ArxivTool,
             #"nature": NatureTool,
             #"pubmed": PubmedTool
         }
+        self.file_manager = FileManager()
+        self.threads =[]
         self.output_dir = os.getenv("OUTPUTS", "data")
         if not os.path.exists(self.output_dir):
             os.makedirs(self.output_dir)
@@ -29,48 +33,105 @@ class ResearchAgent:
         Generates 3x3 queries for the first 3 tools based on the prompt using an LLM.
         Returns a list of lists of strings.
         """
-        #tool_names = list(self.tools.keys())
         
         llm_prompt = f"""
         You are a research assistant.
         My research goal is: "{prompt}".
-        
         Please generate 3 distinct search queries to extract as 
         much infromation as possible form the search queries
         """
         queries = self.gem.ask(llm_prompt)
-
+        print("queries", queries)
         return queries
 
+    def research_workflow(self, user_id: str, session_id: str, file_urls: List[str]):
+        """
+        Executes the research workflow:
+        1. Receives file contents (bytes) and URLs from a research thread.
+        2. Uses FileManager to process/extract components from these files.
+        3. Upserts the extracted components (Modules, Fields, Params, Methods).
+        4. Updates the session's research_files list.
+        """
+        print(f"Starting research workflow for session {session_id}...")
 
-        
-        
-        try:
-            response_text = self.gem.ask(llm_prompt)
-            # Clean up potential markdown code blocks if the LLM adds them
-            if response_text:
-                cleaned_text = response_text.strip()
-                if cleaned_text.startswith("```json"):
-                    cleaned_text = cleaned_text[7:]
-                if cleaned_text.startswith("```"):
-                    cleaned_text = cleaned_text[3:]
-                if cleaned_text.endswith("```"):
-                    cleaned_text = cleaned_text[:-3]
-                
-                queries = json.loads(cleaned_text.strip())
-                
-                if isinstance(queries, list) and len(queries) == 3:
-                    return queries
-            
-            print("Warning: LLM returned unexpected format. Fallback to simple queries.")
-            return [[prompt]*3] * 3
-            
-        except Exception as e:
-            print(f"Error generating queries with LLM: {e}. Fallback to simple queries.")
-            return [[prompt]*3] * 3
+        content = []
+        for url in file_urls:
+            content.append(requests.get(url).content)
 
-    def run(self):
-        prompt = os.getenv("RESEARCH_PROMPT")
+        # Update session research files
+        #session_manager.update_research_files(user_id, session_id, file_urls)
+
+        # We assume these files belong to a single logical 'module' or context for now, 
+        # or we iterate if they are distinct. 
+        # Let's treat them as a batch for a new module or update.
+        # For simplicity, we'll generate a placeholder module ID or derive it.
+        module_id = f"mod_research_{session_id}_{len(file_urls)}"
+
+        # 1. Extract Data using RawModuleExtractor logic (inherited by FileManager)
+        extracted_data = self.file_manager.process_bytes(module_id, content)
+
+        # 2. Prepare data for upsert (similar to process_and_upload_file_config)
+        data_payload = {
+            "id": module_id,
+            "source_urls": file_urls,
+            "description": "Auto-generated from research workflow",
+        }
+
+        # Upsert Params
+        params_dict = extracted_data.get("params", {})
+        if params_dict:
+            params_list = []
+            for p_name, p_type in params_dict.items():
+                params_list.append({
+                    "id": p_name,
+                    "name": p_name,
+                    "param_type": p_type,
+                    "description": f"Extracted from {module_id}",
+                    "user_id": user_id
+                })
+            self.file_manager.param_manager.set_param(params_list, user_id)
+
+        # Upsert Methods
+        methods_list = extracted_data.get("methods", [])
+        if methods_list:
+            for m in methods_list:
+                m["user_id"] = user_id
+                if "nid" in m:
+                    m["id"] = m["nid"]
+            self.file_manager.method_manager.set_method(methods_list, user_id)
+
+        # Upsert Fields
+        fields_list = extracted_data.get("fields", [])
+        if fields_list:
+            for f in fields_list:
+                f["user_id"] = user_id
+                if "nid" in f:
+                    f["id"] = f["nid"]
+            self.file_manager.fields_manager.set_field(fields_list, user_id)
+
+        # Upsert Module
+        module_row = {
+            **data_payload,
+            **extracted_data,
+            "user_id": user_id
+        }
+        # Cleanup lists
+        module_row.pop("methods", None)
+        module_row.pop("fields", None)
+
+        self.file_manager.set_module(module_row, user_id)
+
+        print(f"Research workflow completed for module {module_id}")
+        return module_id
+    
+
+    def run(
+            self,
+            prompt,
+            use_dr_result_callable:Callable,
+            user_id="test_user",
+            session_id="test_session",
+    ):
         if not prompt:
             raise ValueError("RESEARCH_PROMPT environment variable is required.")
 
@@ -80,25 +141,86 @@ class ResearchAgent:
         active_tools = list(self.tools.items())
         
         query = self.generate_queries(prompt)
-        
-        for i, (tool_name, tool_class) in enumerate(active_tools):
 
-            tool_queries = query
-            print(f"Running {tool_name} with queries: {tool_queries}")
-            
-            try:
-                tool = tool_class()
-                
-                # Run for each query generated
-                print(f" run - Query: {query}")
-                query_reqs = {"query": query}
-                query = tool.construct_query(query_reqs)
-                raw_response = tool.run(query)
-                processed_response = tool.process_response(raw_response)
-                self.save_response(f"{tool_name}_{q[:10].replace(' ', '_')}", processed_response)
-                    
-            except Exception as e:
-                print(f"Error running {tool_name}: {e}")
+        if use_dr_result_callable is not None:
+            prompt += "THE RESULT OF THE PROMPT SHOULD JSUT BE 5 top web apths to downlaodabel pdf files (fetchable)"
+            t = threading.Thread(
+                target=self.run_research_thread,
+                args=(prompt, use_dr_result_callable)
+            )
+            self.threads.append(t)
+            t.start()
+            t.join(timeout=999)
+            response = self.gem.ask(
+                prompt
+            )
+            sources = re.findall(r'(https?://\S+|/path/to/\S+)', response)
+            top_5 = list(dict.fromkeys(sources))[:5]
+
+            self.research_workflow(
+                user_id=user_id,
+                session_id=session_id,
+                file_urls=top_5,
+            )
+            print("research thead started")
+
+        else:
+            for i, (tool_name, tool_class) in enumerate(active_tools):
+
+                tool_queries = query
+                print(f"Running {tool_name} with queries: {tool_queries}")
+
+
+
+                try:
+                    tool = tool_class()
+                    # Run for each query generated
+                    print(f" run - Query: {query}")
+                    query_reqs = {"query": query}
+                    query = tool.construct_query(query_reqs)
+                    raw_response = tool.run(query)
+                    processed_response = tool.process_response(raw_response)
+                    self.save_response(f"{tool_name}_{query[:10].replace(' ', '_')}", processed_response)
+
+                except Exception as e:
+                    print(f"Error running {tool_name}: {e}")
+
+
+    from typing import Callable, List
+
+    def run_research_thread(self, prompt: str, callback: Callable[[List[str]], None]):
+        """
+        Startet den Deep Research Agent in einem Thread und gibt die
+        Top 5 Quellen an den Callback weiter.
+        """
+
+
+        try:
+            interaction = self.gem.client.interactions.create(
+                input=prompt,
+                agent='deep-research-pro-preview-12-2025',
+                background=True
+            )
+            print(f"Deep Research gestartet: {interaction.id}")
+            i=0
+            while True:
+                interaction = self.gem.client.interactions.get(interaction.id)
+                if interaction.status == "completed":
+                    full_text = interaction.outputs[-1].text
+                    # Extrahiere Top 5 Quellen (URLs oder Pfade) via Regex
+                    sources = re.findall(r'(https?://\S+|/path/to/\S+)', full_text)
+                    top_5 = list(dict.fromkeys(sources))[:5]  # Eindeutige Top 5
+                    callback(top_5)
+                    break
+                elif interaction.status == "failed":
+                    print(f"Research failed: {interaction.error}")
+                    break
+                i+=1
+                print("t-step", i)
+                time.sleep(10)
+        except Exception as e:
+            print(f"Thread Error: {e}")
+
 
     def save_response(self, tool_name: str, response: Dict[str, Any]):
         #timestamp = int(time.time())
