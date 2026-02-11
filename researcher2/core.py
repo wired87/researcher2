@@ -9,6 +9,8 @@ import requests
 
 from core.file_manager import FileManager
 from gem_core.gem import Gem
+from core.session_manager.session import session_manager
+from vertex_rag.engine import VertexRagEngine
 
 
 class ResearchAgent:
@@ -22,11 +24,13 @@ class ResearchAgent:
             #"pubmed": PubmedTool
         }
         self.file_manager = FileManager()
-        self.threads =[]
+        self.threads = []
         self.output_dir = os.getenv("OUTPUTS", "data")
         if not os.path.exists(self.output_dir):
             os.makedirs(self.output_dir)
         self.gem = Gem()
+        # Vertex AI RAG main class (configured per-session when needed)
+        self.vertex_rag = VertexRagEngine()
 
     def generate_queries(self, prompt: str) -> List[List[str]]:
         """
@@ -54,12 +58,29 @@ class ResearchAgent:
         """
         print(f"Starting research workflow for session {session_id}...")
 
+        # 0. Persist discovered research file URLs on the session
+        try:
+            session_manager.update_research_files(user_id, session_id, file_urls)
+        except Exception as e:
+            print(f"Warning: failed to update research_files for session {session_id}: {e}")
+
+        # 0b. If the session has a dedicated RAG corpus, import the remote files into it
+        rag_engine_for_session = None
+        try:
+            session = session_manager.get_session(int(session_id))
+            corpus_id = session.get("corpus_id") if session else None
+            if corpus_id:
+                rag_engine_for_session = VertexRagEngine(corpus_id=corpus_id)
+                try:
+                    rag_engine_for_session.import_remote_files(paths=file_urls)
+                except Exception as re_err:
+                    print(f"Warning: Vertex RAG import failed for session {session_id}: {re_err}")
+        except Exception as e:
+            print(f"Warning: failed to initialize VertexRagEngine for session {session_id}: {e}")
+
         content = []
         for url in file_urls:
             content.append(requests.get(url).content)
-
-        # Update session research files
-        #session_manager.update_research_files(user_id, session_id, file_urls)
 
         # We assume these files belong to a single logical 'module' or context for now, 
         # or we iterate if they are distinct. 
