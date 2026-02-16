@@ -7,15 +7,13 @@ from typing import Dict, Any, List, Callable
 
 import requests
 
-from core.file_manager import FileManager
-from gem_core.gem import Gem
 from core.session_manager.session import session_manager
 from vertex_rag.engine import VertexRagEngine
 
 
 class ResearchAgent:
-    def __init__(self):
-        self.gem = Gem()
+    def __init__(self, file_manager, gem, vrag_engien):
+        self.gem = gem
         self.tools = {
             #"google_search": GoogleSearchTool,
             #"wolfram_alpha": WolframAlphaTool,
@@ -23,14 +21,36 @@ class ResearchAgent:
             #"nature": NatureTool,
             #"pubmed": PubmedTool
         }
-        self.file_manager = FileManager()
+        self.file_manager = file_manager
         self.threads = []
         self.output_dir = os.getenv("OUTPUTS", "data")
         if not os.path.exists(self.output_dir):
             os.makedirs(self.output_dir)
-        self.gem = Gem()
         # Vertex AI RAG main class (configured per-session when needed)
-        self.vertex_rag = VertexRagEngine()
+        self.vertex_rag = vrag_engien
+
+    def start_research_for_session(self, user_id: str, session_id: str, prompt: str) -> None:
+        """
+        Kick off a deep-research workflow for a session.
+
+        - Uses ResearchAgent to discover relevant documents.
+        - The callback merges discovered URLs into the session's research_files column.
+        - ResearchAgent.research_workflow handles file processing and Vertex RAG ingestion.
+        """
+
+        def _on_sources(urls: List[str]) -> None:
+            try:
+                session_manager.update_research_files(user_id, session_id, urls)
+            except Exception as e:
+                print(f"[OrchestratorManager] Failed to update research_files via callback: {e}")
+
+        self.run(
+            prompt=prompt,
+            use_dr_result_callable=_on_sources,
+            user_id=user_id,
+            session_id=session_id,
+        )
+
 
     def generate_queries(self, prompt: str) -> List[List[str]]:
         """
