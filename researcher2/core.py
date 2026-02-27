@@ -137,8 +137,8 @@ class ResearchAgent:
         if methods_list:
             for m in methods_list:
                 m["user_id"] = user_id
-                if "nid" in m:
-                    m["id"] = m["nid"]
+                if "id" in m:
+                    m["id"] = m["id"]
             self.file_manager.method_manager.set_method(methods_list, user_id)
 
         # Upsert Fields
@@ -146,8 +146,8 @@ class ResearchAgent:
         if fields_list:
             for f in fields_list:
                 f["user_id"] = user_id
-                if "nid" in f:
-                    f["id"] = f["nid"]
+                if "id" in f:
+                    f["id"] = f["id"]
             self.file_manager.fields_manager.set_field(fields_list, user_id)
 
         # Upsert Module
