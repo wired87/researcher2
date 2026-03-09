@@ -1,275 +1,296 @@
 import os
 import json
 import re
-import threading
 import time
-from typing import Dict, Any, List, Callable
+from typing import Dict, Any, List, Callable, Optional, Tuple
 
 import requests
 
-from core.session_manager.session import session_manager
-from vertex_rag.engine import VertexRagEngine
+from qbrain.core.session_manager.session import session_manager
+
+# Default deep-research backend: "chatgpt" (LangChain + OpenAI + search) or "gemini"
+DEFAULT_DEEP_RESEARCH_BACKEND = os.environ.get("DEEP_RESEARCH_BACKEND", "chatgpt").strip().lower()
+
+
+def _extract_urls_from_text(text: str, max_urls: int = 5) -> List[str]:
+    """Extract HTTP(S) URLs from text; return up to max_urls unique."""
+    if not text:
+        return []
+    sources = re.findall(r'https?://[^\s\)\]\>"]+', text)
+    return list(dict.fromkeys(sources))[:max_urls]
+
+
+def _fetch_url_contents(urls: List[str]) -> List[Tuple[str, bytes]]:
+    """Fetch raw content (bytes) for each URL. Returns list of (url, content)."""
+    results: List[Tuple[str, bytes]] = []
+    for url in urls:
+        try:
+            resp = requests.get(url, timeout=30)
+            resp.raise_for_status()
+            results.append((url, resp.content))
+        except Exception as e:
+            print(f"[ResearchAgent] fetch failed for {url[:60]}...: {e}")
+    return results
 
 
 class ResearchAgent:
-    def __init__(self, file_manager, gem, vrag_engien):
+    def __init__(
+        self,
+        file_manager,
+        gem,
+        deep_research_backend: str = DEFAULT_DEEP_RESEARCH_BACKEND,
+    ):
         self.gem = gem
-        self.tools = {
-            #"google_search": GoogleSearchTool,
-            #"wolfram_alpha": WolframAlphaTool,
-            #s"arxiv": ArxivTool,
-            #"nature": NatureTool,
-            #"pubmed": PubmedTool
-        }
         self.file_manager = file_manager
-        self.threads = []
+        self.tools = {}
         self.output_dir = os.getenv("OUTPUTS", "data")
         if not os.path.exists(self.output_dir):
             os.makedirs(self.output_dir)
-        # Vertex AI RAG main class (configured per-session when needed)
-        self.vertex_rag = vrag_engien
+        self.deep_research_backend = (
+            deep_research_backend if deep_research_backend in ("chatgpt", "gemini") else "chatgpt"
+        )
 
-    def start_research_for_session(self, user_id: str, session_id: str, prompt: str) -> None:
+    def start_research_for_session(
+        self, user_id: str, session_id: str, prompt: str
+    ) -> Dict[str, Any]:
         """
-        Kick off a deep-research workflow for a session.
-
-        - Uses ResearchAgent to discover relevant documents.
-        - The callback merges discovered URLs into the session's research_files column.
-        - ResearchAgent.research_workflow handles file processing and Vertex RAG ingestion.
+        Run deep research for a session and return found URLs and file content.
+        Updates session research_files with discovered URLs.
         """
-
-        def _on_sources(urls: List[str]) -> None:
-            try:
-                session_manager.update_research_files(user_id, session_id, urls)
-            except Exception as e:
-                print(f"[OrchestratorManager] Failed to update research_files via callback: {e}")
-
-        self.run(
+        result = self.run(
             prompt=prompt,
-            use_dr_result_callable=_on_sources,
+            use_dr_result_callable=lambda urls: session_manager.update_research_files(
+                user_id, session_id, urls
+            ),
             user_id=user_id,
             session_id=session_id,
         )
+        return result or {}
 
-
-    def generate_queries(self, prompt: str) -> List[List[str]]:
-        """
-        Generates 3x3 queries for the first 3 tools based on the prompt using an LLM.
-        Returns a list of lists of strings.
-        """
-        
+    def generate_queries(self, prompt: str) -> List[str]:
+        """Generate search queries from the prompt using the LLM."""
         llm_prompt = f"""
-        You are a research assistant.
-        My research goal is: "{prompt}".
-        Please generate 3 distinct search queries to extract as 
-        much infromation as possible form the search queries
-        """
-        queries = self.gem.ask(llm_prompt)
-        print("queries", queries)
-        return queries
-
-    def research_workflow(self, user_id: str, session_id: str, file_urls: List[str]):
-        """
-        Executes the research workflow:
-        1. Receives file contents (bytes) and URLs from a research thread.
-        2. Uses FileManager to process/extract components from these files.
-        3. Upserts the extracted components (Modules, Fields, Params, Methods).
-        4. Updates the session's research_files list.
-        """
-        print(f"Starting research workflow for session {session_id}...")
-
-        # 0. Persist discovered research file URLs on the session
+You are a research assistant.
+My research goal is: "{prompt}".
+Please generate 3 distinct search queries to extract as much information as possible from the search.
+Return only the queries, one per line or comma-separated.
+"""
         try:
-            session_manager.update_research_files(user_id, session_id, file_urls)
+            raw = self.gem.ask(llm_prompt)
+            if isinstance(raw, list):
+                return raw
+            text = (raw or "").strip()
+            queries = [q.strip() for q in re.split(r"[\n,]", text) if q.strip()][:3]
+            return queries or [prompt]
         except Exception as e:
-            print(f"Warning: failed to update research_files for session {session_id}: {e}")
+            print(f"[ResearchAgent] generate_queries: {e}")
+            return [prompt]
 
-        # 0b. If the session has a dedicated RAG corpus, import the remote files into it
-        rag_engine_for_session = None
-        try:
-            session = session_manager.get_session(int(session_id))
-            corpus_id = session.get("corpus_id") if session else None
-            if corpus_id:
-                rag_engine_for_session = VertexRagEngine(corpus_id=corpus_id)
-                try:
-                    rag_engine_for_session.import_remote_files(paths=file_urls)
-                except Exception as re_err:
-                    print(f"Warning: Vertex RAG import failed for session {session_id}: {re_err}")
-        except Exception as e:
-            print(f"Warning: failed to initialize VertexRagEngine for session {session_id}: {e}")
-
-        content = []
-        for url in file_urls:
-            content.append(requests.get(url).content)
-
-        # We assume these files belong to a single logical 'module' or context for now, 
-        # or we iterate if they are distinct. 
-        # Let's treat them as a batch for a new module or update.
-        # For simplicity, we'll generate a placeholder module ID or derive it.
-        module_id = f"mod_research_{session_id}_{len(file_urls)}"
-
-        # 1. Extract Data using RawModuleExtractor logic (inherited by FileManager)
-        extracted_data = self.file_manager.process_bytes(module_id, content)
-
-        # 2. Prepare data for upsert (similar to process_and_upload_file_config)
-        data_payload = {
-            "id": module_id,
-            "source_urls": file_urls,
-            "description": "Auto-generated from research workflow",
-        }
-
-        # Upsert Params
-        params_dict = extracted_data.get("params", {})
-        if params_dict:
-            params_list = []
-            for p_name, p_type in params_dict.items():
-                params_list.append({
-                    "id": p_name,
-                    "name": p_name,
-                    "param_type": p_type,
-                    "description": f"Extracted from {module_id}",
-                    "user_id": user_id
-                })
-            self.file_manager.param_manager.set_param(params_list, user_id)
-
-        # Upsert Methods
-        methods_list = extracted_data.get("methods", [])
-        if methods_list:
-            for m in methods_list:
-                m["user_id"] = user_id
-                if "id" in m:
-                    m["id"] = m["id"]
-            self.file_manager.method_manager.set_method(methods_list, user_id)
-
-        # Upsert Fields
-        fields_list = extracted_data.get("fields", [])
-        if fields_list:
-            for f in fields_list:
-                f["user_id"] = user_id
-                if "id" in f:
-                    f["id"] = f["id"]
-            self.file_manager.fields_manager.set_field(fields_list, user_id)
-
-        # Upsert Module
-        module_row = {
-            **data_payload,
-            **extracted_data,
-            "user_id": user_id
-        }
-        # Cleanup lists
-        module_row.pop("methods", None)
-        module_row.pop("fields", None)
-
-        self.file_manager.set_module(module_row, user_id)
-
-        print(f"Research workflow completed for module {module_id}")
-        return module_id
-    
-
-    def run(
-            self,
-            prompt,
-            use_dr_result_callable:Callable,
-            user_id="test_user",
-            session_id="test_session",
-    ):
-        if not prompt:
-            raise ValueError("RESEARCH_PROMPT environment variable is required.")
-
-        print(f"Starting research for: {prompt}")
-        
-        # Get the first 3 tools to match the 3x3 queries
-        active_tools = list(self.tools.items())
-        
-        query = self.generate_queries(prompt)
-
-        if use_dr_result_callable is not None:
-            prompt += "THE RESULT OF THE PROMPT SHOULD JSUT BE 5 top web apths to downlaodabel pdf files (fetchable)"
-            t = threading.Thread(
-                target=self.run_research_thread,
-                args=(prompt, use_dr_result_callable)
-            )
-            self.threads.append(t)
-            t.start()
-            t.join(timeout=999)
-            response = self.gem.ask(
-                prompt
-            )
-            sources = re.findall(r'(https?://\S+|/path/to/\S+)', response)
-            top_5 = list(dict.fromkeys(sources))[:5]
-
-            self.research_workflow(
-                user_id=user_id,
-                session_id=session_id,
-                file_urls=top_5,
-            )
-            print("research thead started")
-
-        else:
-            for i, (tool_name, tool_class) in enumerate(active_tools):
-
-                tool_queries = query
-                print(f"Running {tool_name} with queries: {tool_queries}")
-
-
-
-                try:
-                    tool = tool_class()
-                    # Run for each query generated
-                    print(f" run - Query: {query}")
-                    query_reqs = {"query": query}
-                    query = tool.construct_query(query_reqs)
-                    raw_response = tool.run(query)
-                    processed_response = tool.process_response(raw_response)
-                    self.save_response(f"{tool_name}_{query[:10].replace(' ', '_')}", processed_response)
-
-                except Exception as e:
-                    print(f"Error running {tool_name}: {e}")
-
-
-    from typing import Callable, List
-
-    def run_research_thread(self, prompt: str, callback: Callable[[List[str]], None]):
-        """
-        Startet den Deep Research Agent in einem Thread und gibt die
-        Top 5 Quellen an den Callback weiter.
-        """
-
-
+    def _get_paper_urls_gemini(self, prompt: str, max_urls: int = 5) -> List[str]:
+        """Use Gemini deep-research interaction to get paper URLs."""
         try:
             interaction = self.gem.client.interactions.create(
                 input=prompt,
-                agent='deep-research-pro-preview-12-2025',
-                background=True
+                agent="deep-research-pro-preview-12-2025",
+                background=True,
             )
-            print(f"Deep Research gestartet: {interaction.id}")
-            i=0
-            while True:
+            print(f"[ResearchAgent] Gemini deep research started: {interaction.id}")
+            for i in range(120):  # ~20 min at 10s
                 interaction = self.gem.client.interactions.get(interaction.id)
                 if interaction.status == "completed":
-                    full_text = interaction.outputs[-1].text
-                    # Extrahiere Top 5 Quellen (URLs oder Pfade) via Regex
-                    sources = re.findall(r'(https?://\S+|/path/to/\S+)', full_text)
-                    top_5 = list(dict.fromkeys(sources))[:5]  # Eindeutige Top 5
-                    callback(top_5)
-                    break
-                elif interaction.status == "failed":
-                    print(f"Research failed: {interaction.error}")
-                    break
-                i+=1
-                print("t-step", i)
+                    full_text = (interaction.outputs or [])[-1].text if interaction.outputs else ""
+                    return _extract_urls_from_text(full_text, max_urls=max_urls)
+                if interaction.status == "failed":
+                    print(f"[ResearchAgent] Gemini deep research failed: {getattr(interaction, 'error', 'unknown')}")
+                    return []
                 time.sleep(10)
+            print("[ResearchAgent] Gemini deep research timeout")
+            return []
         except Exception as e:
-            print(f"Thread Error: {e}")
+            print(f"[ResearchAgent] _get_paper_urls_gemini: {e}")
+            return []
 
+    def _get_paper_urls_chatgpt(self, prompt: str, max_urls: int = 5) -> List[str]:
+        """Use LangChain (OpenAI + search) to find paper URLs."""
+        try:
+            from langchain_openai import ChatOpenAI
+            from langchain_community.tools import DuckDuckGoSearchRun
+            from langchain_core.messages import HumanMessage, SystemMessage
+            from langchain_core.output_parsers import StrOutputParser
+        except ImportError as e:
+            print(f"[ResearchAgent] LangChain not available for ChatGPT deep research: {e}")
+            return []
 
-    def save_response(self, tool_name: str, response: Dict[str, Any]):
-        #timestamp = int(time.time())
-        filename = f"{tool_name}"
-        
-        content = response["content"]
-        response_type = response["type"]
+        try:
+            llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+            search = DuckDuckGoSearchRun(max_results=8)
+            system = (
+                "You are a research assistant. Your task is to find downloadable PDF or paper URLs "
+                "relevant to the user's query. Return only a list of full URLs, one per line. "
+                "Prefer direct PDF links (e.g. arxiv.org/pdf/..., PDF links from publishers)."
+            )
+            user_msg = (
+                f"Find up to {max_urls} direct URLs to research papers or PDFs about: {prompt}\n\n"
+                "Return only the URLs, one per line, no other text."
+            )
+            # Single search then LLM to extract/rank URLs
+            search_result = search.invoke(prompt[:500])
+            if not search_result:
+                search_result = search.invoke("research papers " + prompt[:300])
+            combined = f"Search results:\n{search_result}\n\nUser query: {prompt}\n\nExtract and return only the best paper/PDF URLs from the search results, one per line (max {max_urls})."
+            chain = llm | StrOutputParser()
+            response = chain.invoke([SystemMessage(content=system), HumanMessage(content=combined)])
+            return _extract_urls_from_text(response or "", max_urls=max_urls)
+        except Exception as e:
+            print(f"[ResearchAgent] _get_paper_urls_chatgpt: {e}")
+            return []
 
+    def deep_research(
+        self,
+        prompt: str,
+        backend: Optional[str] = None,
+        max_urls: int = 5,
+    ) -> Dict[str, Any]:
+        """
+        Run deep research (Gemini or ChatGPT via LangChain) and fetch content from discovered URLs.
+        Returns dict with keys: urls (list[str]), contents (list[bytes]), contents_by_url (dict url -> bytes).
+        """
+        backend = (backend or self.deep_research_backend).strip().lower()
+        if backend not in ("chatgpt", "gemini"):
+            backend = "chatgpt"
+        urls = (
+            self._get_paper_urls_chatgpt(prompt, max_urls=max_urls)
+            if backend == "chatgpt"
+            else self._get_paper_urls_gemini(prompt, max_urls=max_urls)
+        )
+        if not urls:
+            return {"urls": [], "contents": [], "contents_by_url": {}}
+        fetched = _fetch_url_contents(urls)
+        contents = [b for _, b in fetched]
+        contents_by_url = {u: b for u, b in fetched}
+        return {
+            "urls": urls,
+            "contents": contents,
+            "contents_by_url": contents_by_url,
+        }
+
+    def research_workflow(
+        self,
+        user_id: str,
+        session_id: str,
+        file_urls: List[str],
+        file_contents: Optional[List[bytes]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Persist URLs on session, optionally process file content via FileManager, and return
+        found file content (urls + contents). No Vertex RAG.
+        """
+        print(f"[ResearchAgent] Starting research workflow for session {session_id}...")
+        try:
+            session_manager.update_research_files(user_id, session_id, file_urls)
+        except Exception as e:
+            print(f"[ResearchAgent] Warning: update_research_files failed: {e}")
+
+        # Fetch content if not provided
+        if file_contents is None or len(file_contents) != len(file_urls):
+            fetched = _fetch_url_contents(file_urls)
+            file_contents = [b for _, b in fetched]
+            file_urls = [u for u, _ in fetched]
+
+        module_id = f"mod_research_{session_id}_{len(file_urls)}"
+        extracted_data = None
+        try:
+            extracted_data = self.file_manager.process_bytes(module_id, file_contents)
+        except Exception as e:
+            print(f"[ResearchAgent] process_bytes skipped: {e}")
+
+        if extracted_data:
+            from qbrain.core.managers_context import get_param_manager, get_field_manager, get_method_manager
+            param_mgr = getattr(self.file_manager, "param_manager", None) or get_param_manager()
+            method_mgr = getattr(self.file_manager, "method_manager", None) or get_method_manager()
+            field_mgr = getattr(self.file_manager, "fields_manager", None) or get_field_manager()
+            data_payload = {
+                "id": module_id,
+                "source_urls": file_urls,
+                "description": "Auto-generated from research workflow",
+            }
+            params_dict = extracted_data.get("params", {})
+            if params_dict:
+                params_list = [
+                    {
+                        "id": p_name,
+                        "name": p_name,
+                        "param_type": p_type,
+                        "description": f"Extracted from {module_id}",
+                        "user_id": user_id,
+                    }
+                    for p_name, p_type in params_dict.items()
+                ]
+                param_mgr.set_param(params_list, user_id)
+            methods_list = extracted_data.get("methods", [])
+            if methods_list:
+                for m in methods_list:
+                    m["user_id"] = user_id
+                method_mgr.set_method(methods_list, user_id)
+            fields_list = extracted_data.get("fields", [])
+            if fields_list:
+                for f in fields_list:
+                    f["user_id"] = user_id
+                field_mgr.set_field(fields_list, user_id)
+            module_row = {
+                **data_payload,
+                **extracted_data,
+                "user_id": user_id,
+            }
+            module_row.pop("methods", None)
+            module_row.pop("fields", None)
+            self.file_manager.set_module(module_row, user_id)
+        print(f"[ResearchAgent] Research workflow completed for module {module_id}")
+
+        return {
+            "urls": file_urls,
+            "contents": file_contents,
+            "module_id": module_id,
+        }
+
+    def run(
+        self,
+        prompt: str,
+        use_dr_result_callable: Optional[Callable[[List[str]], None]] = None,
+        user_id: str = "test_user",
+        session_id: str = "test_session",
+    ) -> Dict[str, Any]:
+        """
+        Run deep research (backend from init), fetch content, optionally call callback with URLs,
+        run research_workflow, and return found file content (urls + contents).
+        """
+        if not prompt:
+            raise ValueError("Research prompt is required.")
+        print(f"[ResearchAgent] Starting research for: {prompt[:80]}...")
+        dr = self.deep_research(prompt, max_urls=5)
+        urls = dr.get("urls") or []
+        contents = dr.get("contents") or []
+        if use_dr_result_callable and urls:
+            try:
+                use_dr_result_callable(urls)
+            except Exception as e:
+                print(f"[ResearchAgent] Callback error: {e}")
+        if not urls:
+            print("[ResearchAgent] No URLs found from deep research.")
+            return {"urls": [], "contents": [], "module_id": None}
+        result = self.research_workflow(
+            user_id=user_id,
+            session_id=session_id,
+            file_urls=urls,
+            file_contents=contents,
+        )
+        print("[ResearchAgent] Research run finished.")
+        return result
+
+    def save_response(self, tool_name: str, response: Dict[str, Any]) -> None:
+        filename = tool_name
+        content = response.get("content")
+        response_type = response.get("type", "text")
         if response_type == "json":
             filepath = os.path.join(self.output_dir, f"{filename}.json")
             with open(filepath, "w", encoding="utf-8") as f:
@@ -278,5 +299,4 @@ class ResearchAgent:
             filepath = os.path.join(self.output_dir, f"{filename}.txt")
             with open(filepath, "w", encoding="utf-8") as f:
                 f.write(str(content))
-        
-        print(f"Saved output to {filepath}")
+        print(f"[ResearchAgent] Saved output to {filepath}")

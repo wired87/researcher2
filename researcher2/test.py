@@ -1,4 +1,4 @@
-from core.researcher2.researcher2.core import ResearchAgent
+from qbrain.core.researcher2.researcher2.core import ResearchAgent
 
 if __name__ =="__main__":
     r = ResearchAgent()
